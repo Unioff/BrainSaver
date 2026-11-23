@@ -4,6 +4,8 @@ BrainSaver - eye-break reminder.
 Every 20 minutes (counted from the last time the ball was closed) a small
 red 20x20 px dot appears in the top-right corner of the primary monitor.
 
+  * Dot appears    -> a large red ball saying "Spočij si oči" grows, holds
+                      and fades; the small dot keeps blinking.
   * Click the dot  -> a 20 second countdown starts next to it.
   * Countdown ends -> the dot blows up into a large, semi-transparent ball
                       telling the user to look out the window.
@@ -15,6 +17,7 @@ red 20x20 px dot appears in the top-right corner of the primary monitor.
 Right-click the dot to quit BrainSaver.
 """
 
+import math
 import sys
 import threading
 import time
@@ -36,7 +39,7 @@ BLINK_COUNT = 3                   # blinks per round
 BLINK_MIN_ALPHA = 0.3             # dot opacity at the bottom of a blink
 BLINK_STEP_MS = 150   
 IDLE_TIMEOUT_MS = 5 * 60 * 1000        # 5 min without keyboard/mous
-BLINK_REPEAT_MS = 20 * 1000            # 20 s between blink rounds            # time per opacity change (fast blink)
+BLINK_REPEAT_MS = 5 * 1000            # 5 s between blink rounds            # time per opacity change (fast blink)
 if TEST:
     REMINDER_INTERVAL_MS = 10 * 1000   # 10 s
     COUNTDOWN_SECONDS = 3
@@ -46,16 +49,21 @@ else:
     COUNTDOWN_SECONDS = 20
 
 BALL_MAX_SIZE = 320               # px, final size of the ball
-BALL_ALPHA = 0.45                 # 0 = invisible, 1 = opaque
+BALL_PEAK_ALPHA = 0.85            # 0 = invisible, 1 = opaque; reached while holding
 ANIM_STEPS = 30
 ANIM_FRAME_MS = 16
 BALL_HOLD_MS = 4000               # how long the full ball stays before fading
 FADE_STEPS = 30
 FADE_FRAME_MS = 50                # ~1.5 s fade-out in total
+FADE_ALPHA_FRACTION = 0.4         # opacity hits 0 after 40% of the fade
 
 RED = "#e03131"
 BALL_COLOR = "#2f9e44"            # big ball is green
 BALL_OUTLINE = "#8ce99a"
+START_BALL_COLOR = RED           # big red ball shown when the dot appears
+START_BALL_OUTLINE = "#ffa8a8"
+START_BALL_TEXT = "Spočij si oči"
+END_BALL_TEXT = "Oči so spočite"
 KEY_COLOR = "#010203"             # transparent key colour (Windows)
 LABEL_BG = "#222222"
 LABEL_FG = "#ffffff"
@@ -160,6 +168,102 @@ def get_other_monitor_rect():
         return None
 
 
+class Ball:
+    """A big circle that grows from dot size, shows a text, holds, then fades
+    out. Used for the red start ball and the green end ball."""
+
+    def __init__(self, app, color, outline, text, on_close=None):
+        self.app = app
+        self.color = color
+        self.outline = outline
+        self.text = text
+        self.on_close = on_close
+        self.win = None
+        self.canvas = None
+        self.job = None
+        self.closed = False
+
+    def start(self):
+        # One window covering the whole monitor, created once and never
+        # resized: the ball is drawn centred in it, so no window changes size
+        # or moves while it grows and fades.
+        self.rect = self.app._other_monitor()
+        left, top, right, bottom = self.rect
+        self.w, self.h = right - left, bottom - top
+        self.win, self.canvas = self.app._overlay(self.w, self.h, left, top)
+        self.win.attributes("-alpha", 0.0)  # fade in from invisible
+        self.canvas.bind("<Button-1>", lambda e: self.close())
+        self._animate(0)
+        self.win.deiconify()  # first frame is already drawn at zero opacity
+
+    def _draw(self, cx, cy, radius, with_text):
+        c = self.canvas
+        c.delete("all")
+        c.create_oval(cx - radius, cy - radius, cx + radius, cy + radius,
+                      fill=self.color, outline=self.outline, width=4)
+        if with_text:
+            c.create_text(cx, cy, text=self.text,
+                          fill="white", font=("Segoe UI", 18, "bold"),
+                          justify="center")
+
+    def _animate(self, step):
+        self.job = None
+        if self.canvas is None:
+            return
+        t = step / ANIM_STEPS
+        ease = 1 - (1 - t) ** 3              # ease-out cubic
+        d = int(DOT_SIZE + (BALL_MAX_SIZE - DOT_SIZE) * ease)
+        self._draw(self.w / 2, self.h / 2, d / 2,
+                   with_text=step >= ANIM_STEPS)
+        # fade in while growing: opacity ramps from 0 up to BALL_PEAK_ALPHA
+        self.win.attributes("-alpha", BALL_PEAK_ALPHA * ease)
+        if step < ANIM_STEPS:
+            self.job = self.app.root.after(ANIM_FRAME_MS,
+                                           self._animate, step + 1)
+        else:
+            self.job = self.app.root.after(BALL_HOLD_MS, self._fade, 0)
+
+    def _fade(self, step):
+        """Grow the ball across the whole monitor while it fades out."""
+        self.job = None
+        if self.win is None:
+            return
+        if step >= FADE_STEPS:
+            self.close()
+            return
+        t = (step + 1) / FADE_STEPS
+        ease = 1 - (1 - t) ** 3              # ease-out cubic
+        start_r = BALL_MAX_SIZE / 2
+        end_r = math.hypot(self.w, self.h) / 2   # reaches the screen corners
+        radius = start_r + (end_r - start_r) * ease
+
+        self._draw(self.w / 2, self.h / 2, radius, with_text=True)
+        # opacity reaches zero early (FADE_ALPHA_FRACTION) while growth continues
+        alpha = BALL_PEAK_ALPHA * max(0.0, 1 - t / FADE_ALPHA_FRACTION)
+        self.win.attributes("-alpha", alpha)
+        self.job = self.app.root.after(FADE_FRAME_MS, self._fade, step + 1)
+
+    def discard(self):
+        """Remove the ball immediately, without calling on_close."""
+        if self.job is not None:
+            try:
+                self.app.root.after_cancel(self.job)
+            except tk.TclError:
+                pass
+            self.job = None
+        self.app._destroy(self.win)
+        self.win = None
+        self.canvas = None
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.discard()
+        if self.on_close is not None:
+            self.on_close()
+
+
 class BrainSaver:
     def __init__(self, root):
         self.root = root
@@ -167,12 +271,11 @@ class BrainSaver:
 
         self.dot_win = None
         self.countdown_win = None
-        self.ball_win = None
-        self.ball_canvas = None
+        self.start_ball = None       # red ball shown when the dot appears
+        self.ball = None             # green ball shown after the countdown
 
         self.reminder_job = None
         self.countdown_job = None
-        self.anim_job = None
         self.idle_job = None
         self.blink_job = None
         self.idle = False
@@ -192,20 +295,21 @@ class BrainSaver:
     def restart_timers(self):
         """After a Windows unlock: clear the current reminder and start the
         20 minute timer again from now."""
-        for job in (self.countdown_job, self.anim_job, self.blink_job):
+        for job in (self.countdown_job, self.blink_job):
             if job is not None:
                 try:
                     self.root.after_cancel(job)
                 except tk.TclError:
                     pass
         self.countdown_job = None
-        self.anim_job = None
         self.blink_job = None
         self._destroy(self.countdown_win)
         self.countdown_win = None
-        self._destroy(self.ball_win)
-        self.ball_win = None
-        self.ball_canvas = None
+        for ball in (self.start_ball, self.ball):
+            if ball is not None:
+                ball.discard()
+        self.start_ball = None
+        self.ball = None
         self.hide_dot()
         self.idle = False
         self.schedule_reminder(REMINDER_INTERVAL_MS)
@@ -236,8 +340,10 @@ class BrainSaver:
     # Helpers
     # ------------------------------------------------------------------
     def _overlay(self, width, height, x, y):
-        """Borderless, always-on-top window with a transparent background."""
+        """Borderless, always-on-top window with a transparent background.
+        Returned hidden; the caller calls deiconify() once it is drawn."""
         win = tk.Toplevel(self.root)
+        win.withdraw()
         win.overrideredirect(True)
         win.attributes("-topmost", True)
         win.configure(bg=KEY_COLOR)
@@ -286,16 +392,29 @@ class BrainSaver:
         self.reminder_job = None
         if self.dot_win is not None:
             return
+        self._show_start_ball()  # created first so the small dot stays on top
         x, y = self._dot_position()
         win, canvas = self._overlay(DOT_SIZE, DOT_SIZE, x, y)
         canvas.create_oval(0, 0, DOT_SIZE - 1, DOT_SIZE - 1,
                            fill=RED, outline=RED)
         canvas.bind("<Button-1>", lambda e: self.start_countdown())
         canvas.bind("<Button-3>", lambda e: self.quit())
+        win.deiconify()  # show only now that the dot is drawn
         self.dot_win = win
         self.status = "Dot shown - click to start"
         self.next_dot_at = None
         self._start_blink()
+
+    def _show_start_ball(self):
+        if self.start_ball is not None:
+            return
+        self.start_ball = Ball(self, START_BALL_COLOR, START_BALL_OUTLINE,
+                               START_BALL_TEXT,
+                               on_close=self._start_ball_closed)
+        self.start_ball.start()
+
+    def _start_ball_closed(self):
+        self.start_ball = None
 
     def hide_dot(self):
         if self.blink_job is not None:
@@ -370,59 +489,12 @@ class BrainSaver:
     # ------------------------------------------------------------------
     def blow_up(self):
         self.status = "Ball showing"
-        left, top, right, bottom = self._other_monitor()
-        x = left + ((right - left) - BALL_MAX_SIZE) // 2
-        y = top + ((bottom - top) - BALL_MAX_SIZE) // 2
-        win, canvas = self._overlay(BALL_MAX_SIZE, BALL_MAX_SIZE, x, y)
-        win.attributes("-alpha", BALL_ALPHA)
-        canvas.bind("<Button-1>", lambda e: self.close_ball())
-        self.ball_win = win
-        self.ball_canvas = canvas
-        self._animate(0)
+        self.ball = Ball(self, BALL_COLOR, BALL_OUTLINE, END_BALL_TEXT,
+                         on_close=self._ball_closed)
+        self.ball.start()
 
-    def _animate(self, step):
-        self.anim_job = None
-        if self.ball_canvas is None:
-            return
-        t = step / ANIM_STEPS
-        ease = 1 - (1 - t) ** 3              # ease-out cubic
-        d = int(DOT_SIZE + (BALL_MAX_SIZE - DOT_SIZE) * ease)
-        offset = (BALL_MAX_SIZE - d) // 2
-
-        c = self.ball_canvas
-        c.delete("all")
-        c.create_oval(offset, offset, offset + d, offset + d,
-                      fill=BALL_COLOR, outline=BALL_OUTLINE, width=4)
-        if step < ANIM_STEPS:
-            self.anim_job = self.root.after(ANIM_FRAME_MS,
-                                            self._animate, step + 1)
-        else:
-            c.create_text(BALL_MAX_SIZE // 2, BALL_MAX_SIZE // 2,
-                          text="Oči so spočite",
-                          fill="white", font=("Segoe UI", 18, "bold"),
-                          justify="center")
-            self.anim_job = self.root.after(BALL_HOLD_MS, self._fade, 0)
-
-    def _fade(self, step):
-        self.anim_job = None
-        if self.ball_win is None:
-            return
-        if step == 0:
-            self.status = "Ball fading"
-        if step >= FADE_STEPS:
-            self.close_ball()
-            return
-        self.ball_win.attributes("-alpha",
-                                 BALL_ALPHA * (1 - step / FADE_STEPS))
-        self.anim_job = self.root.after(FADE_FRAME_MS, self._fade, step + 1)
-
-    def close_ball(self):
-        if self.anim_job is not None:
-            self.root.after_cancel(self.anim_job)
-            self.anim_job = None
-        self._destroy(self.ball_win)
-        self.ball_win = None
-        self.ball_canvas = None
+    def _ball_closed(self):
+        self.ball = None
         if not self.idle:  # if idle, the timer restarts when the user returns
             self.schedule_reminder(REMINDER_INTERVAL_MS)
         else:
@@ -476,14 +548,17 @@ class BrainSaver:
                 self.tray.stop()
             except Exception:
                 pass
-        for job in (self.reminder_job, self.countdown_job, self.anim_job,
+        for job in (self.reminder_job, self.countdown_job,
                     self.idle_job, self.blink_job, self.tray_job):
             if job is not None:
                 try:
                     self.root.after_cancel(job)
                 except tk.TclError:
                     pass
-        for win in (self.dot_win, self.countdown_win, self.ball_win):
+        for ball in (self.start_ball, self.ball):
+            if ball is not None:
+                ball.discard()
+        for win in (self.dot_win, self.countdown_win):
             self._destroy(win)
         self.root.destroy()
 
